@@ -48,7 +48,7 @@ def get_strut_props(images, thres=threshold):
 
     def _get_props(batch, _struts_props):
         for i in range(batch.shape[0]):
-            bin_image = batch[i, 1] > thres
+            bin_image = batch[i, 0] > thres
             region_info = _get_regions(bin_image)
             props = list()
             for r in region_info["regions"]:

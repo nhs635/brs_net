@@ -10,21 +10,23 @@ import time
 from torchvision.utils import make_grid
 
 from dataset import data_loader
-from network import advanced_networks
+from network import advanced_networks, gan_networks
 from util import misc, metric
 
 import matplotlib.pyplot as plt
 
 
-class SemanticSolver(BaseSolver):
+class AdversarialSolver(BaseSolver):
     def __init__(self, config):
-        super(SemanticSolver, self).__init__(config)
+        super(AdversarialSolver, self).__init__(config)
 
         # Member variables for data
         self.images, self.masks, self.weights, self.outputs = None, None, None, None
-        self.model_types = [self.config.model_type]
-        self.optimizer_types = [self.config.model_type]
-        self.loss_types = ["bce", "l1"]
+        self.model_types, self.optimizer_types = list(), list()
+        for net in ["gen", "dsc"]:
+            self.model_types.append(net)
+            self.optimizer_types.append(net)
+        self.loss_types = ["bce", "l1", "d_real", "d_fake", "g_fake"]
         self.metric_types = ["dice"]
 
         # For evaluation module
@@ -72,27 +74,24 @@ class SemanticSolver(BaseSolver):
 
     def build_model(self):
         # Build model
-        if self.config.model_type == "UNet":
-            self.models[self.model_types[0]] = advanced_networks.UNet(in_channels=self.config.num_img_ch,
-                                                                      out_channels=self.config.num_classes,
-                                                                      num_features=self.config.num_features,
-                                                                      pool="max",
-                                                                      feature_mode="fixed")
-        elif self.config.model_type == "NewBRSNet":
-            self.models[self.model_types[0]] = advanced_networks.BrsResSegNet(in_channels=self.config.num_img_ch,
-                                                                              out_channels=self.config.num_classes)
-        else:
-            raise NotImplementedError("Model type [%s] is not implemented" % self.config.model_type)
+        self.models["gen"] = advanced_networks.UNet(in_channels=self.config.num_img_ch,
+                                                    out_channels=self.config.num_classes,
+                                                    num_features=64, pool="max", feature_mode="fixed")
+        self.models["dsc"] = advanced_networks.UNet(in_channels=self.config.num_img_ch + self.config.num_classes,
+                                                    out_channels=1,
+                                                    num_features=64, pool="max", feature_mode="fixed")
 
         # Build optimizer
-        self.optimizers[self.model_types[0]] = optim.Adam(self.models[self.model_types[0]].parameters(),
-                                                          lr=self.config.lr_opt["init"],
-                                                          betas=(0.9, 0.999),
-                                                          weight_decay=self.config.l2_penalty)
+        for model_type in self.model_types:
+            self.optimizers[model_type] = optim.Adam(self.models[model_type].parameters(),
+                                                     lr=self.config.lr_opt["init"],
+                                                     betas=(0.9, 0.999),
+                                                     weight_decay=self.config.l2_penalty)
 
         # Build criterion
         self.criteria["bce"] = nn.BCELoss
         self.criteria["l1"] = nn.L1Loss()
+        self.criteria["gan"] = gan_networks.GANLoss(self.config.gan_mode)
 
         # Model initialization
         for model_type in self.model_types:
@@ -106,35 +105,68 @@ class SemanticSolver(BaseSolver):
         self.masks = masks.to(self.device)  # n2hw (binary classification)
         self.weights = weights.to(self.device)  # n1hw?
 
-        # Prediction (forward)
-        self.outputs = self.models[self.model_types[0]](self.images)
+        # Generation (forward)
+        self.outputs = self.models["gen"](self.images)
 
-    def backward(self, phase="train"):
-        # Backward to calculate the gradient
-        # Loss defition
-        bce_loss = self.criteria["bce"]()(self.outputs, self.masks)
-        l1_loss = self.config.l1_weight * self.criteria["l1"](self.outputs, self.masks)
+    def backward(self):
+        pass
+
+    def d_backward(self, phase="train"):
+        # Backward to calculate the gradient by discriminator
+        # Discrimination of real case
+        output_real = self.models["dsc"](torch.cat((self.images, self.masks), dim=1))
+
+        # Discrimination of fake case
+        output_fake = self.models["dsc"](torch.cat((self.images, self.outputs), dim=1))
+
+        # Discriminator loss defition
+        d_loss_real = self.config.adv_weight * self.criteria["gan"](output_real, True)  # validity map
+        d_loss_fake = self.config.adv_weight * self.criteria["gan"](output_fake, False)  # validity map
 
         # Loss integration and gradient calculation (backward)
-        loss = bce_loss + l1_loss
+        loss = (d_loss_real + d_loss_fake) / 2
         if phase == "train":
             loss.backward()
 
+        self.loss["d_real"][phase].append(d_loss_real.item())
+        self.loss["d_fake"][phase].append(d_loss_fake.item())
+
+    def g_backward(self, phase="train"):
+        # Backward to calculate the gradient by generator
+        # Discrimination of fake case (fooling discriminator)
+        output_fake = self.models["dsc"](torch.cat((self.images, self.outputs), dim=1))
+
+        # Generator loss defition
+        g_loss = self.config.adv_weight * self.criteria["gan"](output_fake, True)
+
+        # BCE & L1 similarity loss definition
+        bce_loss = self.config.bce_weight * self.criteria["bce"]()(self.outputs, self.masks)
+        l1_loss = self.config.l1_weight * self.criteria["l1"](self.outputs, self.masks)
+
+        # Loss integration and gradient calculation (backward)
+        loss = g_loss + bce_loss + l1_loss
+        if phase == "train":
+            loss.backward()
+
+        self.loss["g_fake"][phase].append(g_loss.item())
         self.loss["bce"][phase].append(bce_loss.item())
         self.loss["l1"][phase].append(l1_loss.item())
 
-    def optimize(self, backward):
+    def optimize(self, optimizer_type, backward):
         """ Optimize and update weights according to the calculated gradients. """
-        self.optimizers[self.optimizer_types[0]].zero_grad()
+        assert (optimizer_type in self.optimizer_types)
+
+        gan_networks.set_requires_grad(self.models["dsc"], optimizer_type == "dsc")
+        self.optimizers[optimizer_type].zero_grad()
         backward()
-        self.optimizers[self.optimizer_types[0]].step()
+        self.optimizers[optimizer_type].step()
 
     def evaluate(self):
         self.set_train(is_train=False)
 
         # Intermediate image visualization for performance test
         with torch.no_grad():
-            fix_outputs = self.models[self.model_types[0]](self.fix_images).cpu()
+            fix_outputs = self.models["gen"](self.fix_images).cpu()
         self.fix_col["outputs"] = make_grid((fix_outputs[:, 0, :, :].unsqueeze(dim=1).cpu() > self.config.threshold)
                                             .type(torch.FloatTensor), nrow=1)
         self.fix_grid = torch.cat([self.fix_col[key] for key in ["images", "masks", "outputs"]], dim=2)
@@ -147,7 +179,7 @@ class SemanticSolver(BaseSolver):
                 images = images.to(self.device)  # n1hw (grayscale)
 
                 # Make prediction
-                outputs = self.models[self.model_types[0]](images)
+                outputs = self.models["gen"](images)
                 self.struts_lists["output"].append(outputs.cpu().numpy())
                 # if i == 50:
                     # plt.imsave("image.bmp", images.cpu().numpy()[0])
@@ -184,7 +216,8 @@ class SemanticSolver(BaseSolver):
                 self.forward(images, masks, weights)
 
                 # Backward & Optimize
-                self.optimize(self.backward)
+                self.optimize("dsc", self.d_backward)
+                self.optimize("gen", self.g_backward)
 
                 # Calculate evaluation metrics
                 self.calculate_metric()
@@ -203,7 +236,8 @@ class SemanticSolver(BaseSolver):
                     self.forward(images, masks, weights)
 
                     # Backward
-                    self.backward(phase="valid")
+                    self.backward("dsc", phase="valid")
+                    self.backward("gen", phase="valid")
 
                     # Calculate evaluation metrics
                     self.calculate_metric(phase="valid")

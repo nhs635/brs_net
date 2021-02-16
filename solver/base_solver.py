@@ -197,6 +197,14 @@ class BaseSolver(ABC):
         pass
 
     @abstractmethod
+    def d_backward(self, *args, **kwargs):
+        pass
+
+    @abstractmethod
+    def g_backward(self, *args, **kwargs):
+        pass
+
+    @abstractmethod
     def optimize(self, *args, **kwargs):
         pass
 

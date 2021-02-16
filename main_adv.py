@@ -1,6 +1,7 @@
 
 import argparse
 from solver.semantic_solver import SemanticSolver
+from solver.adversarial_solver import AdversarialSolver
 
 
 def main(config):
@@ -19,19 +20,19 @@ if __name__ == "__main__":
 
     # Path to load/save the trained model
     parser.add_argument("--model_path", type=str,
-                        default="results/models_test_210215_l1_2/")
+                        default="results/models_test_210215_l1_1/")
     parser.add_argument("--model_name", type=str, default="model.pth")
 
     # Device setup
-    parser.add_argument("--device_ids", type=list, default=[0, 1,]) #[2, 3])
+    parser.add_argument("--device_ids", type=list, default=[0, 1,])  #[2, 3])
 
     # Hyper-parameters
-    parser.add_argument("--model_type", type=str, default="UNet")
-    parser.add_argument("--num_features", type=int, default=64)
-
     parser.add_argument("--dataset_path", type=str, default="dataset/")  # Path to load the train/valid datasets
 
+    parser.add_argument("--gan_mode", type=str, default="vanilla")  # GAN loss type (vanilla: BCE vs LSGAN: MSE)
+    parser.add_argument("--bce_weight", type=float, default=1.0)  # BCE loss function weight
     parser.add_argument("--l1_weight", type=float, default=1.0)  # L1 loss funtion weight
+    parser.add_argument("--adv_weight", type=float, default=1.0)  # Adversarial term weight
     parser.add_argument("--l2_penalty", type=float, default=0.0001)  # L2 penalty for L2 regularization
     parser.add_argument("--sample_weight", type=tuple, default=(1.0, 1.0))  # Sample weight
 
