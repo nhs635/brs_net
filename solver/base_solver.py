@@ -63,7 +63,7 @@ class BaseSolver(ABC):
     def build_model(self):
         pass
 
-    def save_model(self, epoch):
+    def save_model(self, epoch, is_print=True):
         checkpoint = {"config": self.config,
                       "lr": self.lr,
                       "model_types": self.model_types,
@@ -79,8 +79,8 @@ class BaseSolver(ABC):
         checkpoint = dict(checkpoint, **model_state_dicts)
         checkpoint = dict(checkpoint, **optimizer_state_dicts)
         torch.save(checkpoint, os.path.join(self.config.model_path, "model.pth"))
-
-        print("Best model (%.3f) is saved to %s" % (self.best_metric, self.config.model_path))
+        if is_print:
+            print("Best model (%.3f) is saved to %s" % (self.best_metric, self.config.model_path))
 
     def save_epoch(self, epoch):
         temp = torch.load(os.path.join(self.config.model_path, "model.pth"))
@@ -164,11 +164,11 @@ class BaseSolver(ABC):
             suffix += "%s: %.5f / " % (metric_type,
                                        sum(self.metric[metric_type][phase]) / max([len(self.metric[metric_type][phase]), 1]))
         if print_func is not None:
-            print_func(step + 1, total_step, prefix=prefix, suffix=suffix, dec=2, bar_len=30)
+            print_func(step + 1, total_step, prefix=prefix, suffix=suffix, dec=1, bar_len=30)
         else:
             print(suffix, end="")
 
-    def log_to_tensorboard(self, epoch, elapsed_time=None, intermediate_output=None, accuracy=None):
+    def log_to_tensorboard(self, epoch, elapsed_time=None, intermediate_output=None, accuracy=None, distance=None):
         if elapsed_time is not None:
             self.tensorboard.add_scalar("elapsed_time", elapsed_time, epoch)
         self.tensorboard.add_scalar("learning_rate", self.lr, epoch)
@@ -178,15 +178,18 @@ class BaseSolver(ABC):
                                                             for phase in self.phase_types}, epoch)
         for metric_type in self.metric_types:
             self.tensorboard.add_scalars("%s" % metric_type, {phase: sum(self.metric[metric_type][phase]) /
-                                                                   max([len(self.metric[metric_type][phase]), 1])
-                                                            for phase in self.phase_types}, epoch)
-        if (epoch % 10) == 0:
+                                                                     max([len(self.metric[metric_type][phase]), 1])
+                                                              for phase in self.phase_types}, epoch)
+        if (epoch % 5) == 0:
             if intermediate_output is not None:
                 self.tensorboard.add_image("intermediate_output", intermediate_output, epoch)
             if accuracy is not None:
                 self.tensorboard.add_scalars("accuracy", {"f-score": accuracy[0],
                                                           "precision": accuracy[1],
                                                           "recall": accuracy[2]}, epoch)
+            # if distance is not None:
+            #     self.tensorboard.add_scalars("distance", {"hausdorff": distance["hd_r"],
+            #                                               "avg_surface": distance["asd_r"]}, epoch)
 
     @abstractmethod
     def forward(self, *args, **kwargs):

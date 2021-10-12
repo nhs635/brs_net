@@ -1,13 +1,19 @@
+
 import math
 import torch
 from skimage.measure import label, regionprops
+from skimage.morphology import binary_erosion
 import numpy as np
+from torch.nn import functional as F
+
+import matplotlib
+import matplotlib.pyplot as plt
 
 eps = 1e-8
 threshold = 0.5
 
 
-def get_similiarity(output, target, ch=None):
+def tversky_index(output, target, ch_weight=None, alpha=0.5):
     """
     Call to calculate similiarity metrics for train, validation and test
     @ inputs:
@@ -17,6 +23,55 @@ def get_similiarity(output, target, ch=None):
         dice similiarity = 2 * inter / (inter + union + e)
         jaccard similiarity = inter / (union + e)
     """
+    # fig, axes = plt.subplots(1, 2)
+    # axes = axes.flatten()
+    # axes[0].imshow(output[0][2].detach().cpu().numpy(), vmin=0, vmax=1)d
+    # plt.showdsd
+    tversky = 0
+
+    if ch_weight is None:
+        output1 = output
+        target1 = target
+
+        true_pos = torch.sum(output1 * target1.float())
+        false_neg = torch.sum(output1 * (1 - target1.float()))
+        false_pos = torch.sum((1 - output1) * target1.float())
+
+        tversky = true_pos / (true_pos + alpha * false_neg + (1 - alpha) * false_pos + eps)
+    else:
+        for ch, weight in enumerate(ch_weight):
+            output1 = output[:, ch, :, :]
+            target1 = target[:, ch, :, :]
+
+            true_pos = torch.sum(output1 * target1.float())
+            false_neg = torch.sum(output1 * (1 - target1.float()))
+            false_pos = torch.sum((1 - output1) * target1.float())
+
+            tversky += weight * true_pos / (true_pos + alpha * false_neg + (1 - alpha) * false_pos + eps)
+
+        tversky = tversky / sum(ch_weight)
+
+    # intersection = torch.sum(output1 * target1.float())
+    # union = torch.sum(output1) + torch.sum(target1.float()) - intersection
+    # dice = 2 * intersection / (union + intersection + eps)
+    # jaccard = intersection / (union + eps)
+    return tversky  #, jaccard
+
+
+def dice_coef(output, target, ch=None):
+    """
+    Call to calculate similiarity metrics for train, validation and test
+    @ inputs:
+        output : predicted model result (N x C x H x W)
+        target : one-hot formatted labels (N x C x H x W)
+    @ outputs:
+        dice similiarity = 2 * inter / (inter + union + e)
+        jaccard similiarity = inter / (union + e)
+    """
+    # fig, axes = plt.subplots(1, 2)
+    # axes = axes.flatten()
+    # axes[0].imshow(output[0][2].detach().cpu().numpy(), vmin=0, vmax=1)d
+    # plt.showdsd
     if ch is not None:
         output1 = output[:, ch, :, :]
         target1 = target[:, ch, :, :]
@@ -28,42 +83,64 @@ def get_similiarity(output, target, ch=None):
     union = torch.sum(output1) + torch.sum(target1.float()) - intersection
     dice = 2 * intersection / (union + intersection + eps)
     # jaccard = intersection / (union + eps)
+
     return dice  #, jaccard
 
 
-def get_strut_props(images, thres=threshold):
+class focal_tversky_loss:
+
+    def __init__(self, ch_weight=None, alpha=0.5, gamma=1):
+        self.ch_weight = ch_weight
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def __call__(self, output, target):
+        tversky_loss = torch.sub(1, tversky_index(output, target, ch_weight=self.ch_weight, alpha=self.alpha))
+        return torch.pow(tversky_loss, self.gamma)
+
+
+def get_strut_props(images):
     """
     Call to obtain property of struts in the image batch
     @ inputs:
-        images: list of images (ndarray) with strut probability (N x 1 x H x W)
+        images: list of images (ndarray) with strut probability (N x H x W)
     @ outputs:
         strut property
     """
-
     def _get_regions(bin_image):
         res = dict()
         res["label_image"] = label(bin_image)
+        erode_image = binary_erosion(bin_image)
+        res["label_contour"] = label(bin_image)
+        res["label_contour"][erode_image == True] = 0
         res["regions"] = regionprops(res["label_image"])
         return res
 
-    def _get_props(batch, _struts_props):
-        for i in range(batch.shape[0]):
-            bin_image = batch[i, 0] > thres
-            region_info = _get_regions(bin_image)
-            props = list()
-            for r in region_info["regions"]:
-                prop = dict()
-                prop["y"], prop["x"] = r.centroid
-                prop["area"] = r.area
-                prop["label"] = r.label
-                prop["region"] = (region_info["label_image"] == prop["label"])
-                prop["original"] = bin_image
-                prop["is_true"] = False
-                prop["dist"] = 100000.0
-                prop["overlap"] = 0.0
+    def _get_props(image, _struts_props):
 
-                props.append(prop)
-            _struts_props.append(props)
+        bin_image = image > 0
+        region_info = _get_regions(bin_image)
+
+        props = list()
+        for r in region_info["regions"]:
+            prop = dict()
+            prop["y"], prop["x"] = r.centroid
+            prop["area"] = r.area
+            prop["label"] = r.label
+            prop["contour"] = np.transpose(np.array(np.where(region_info["label_contour"] == prop["label"])))
+            prop["is_true"] = False
+            prop["label_cnt"] = 0
+            prop["dist"] = 100000.0
+            prop["overlap"] = 0.0
+
+            props.append(prop)
+
+        properties = dict()
+        properties["label_image"] = region_info["label_image"].astype(np.uint8)
+        properties["label_contour"] = region_info["label_contour"].astype(np.uint8)
+        properties["props"] = props
+
+        _struts_props.append(properties)
 
     struts_props = list()
     for img_batch in images:
@@ -72,7 +149,7 @@ def get_strut_props(images, thres=threshold):
     return struts_props
 
 
-def get_accuracy(target_struts_props, output_struts_props, dist_thres=20, overlap_thres=0.5):
+def get_accuracy(target_struts_props, output_struts_props, dist_thres=15, overlap_thres=0.75):
     """
     Call to calculate precision and recall for stent strut detection
     @ inputs:
@@ -86,8 +163,8 @@ def get_accuracy(target_struts_props, output_struts_props, dist_thres=20, overla
     def _set_true_struts(refr_struts_props, comp_struts_props):
         for refr_struts_prop, comp_struts_prop in zip(refr_struts_props, comp_struts_props):
             # Decision by distance
-            for refr_strut_prop in refr_struts_prop:
-                for comp_strut_prop in comp_struts_prop:
+            for ir, refr_strut_prop in enumerate(refr_struts_prop["props"]):
+                for ic, comp_strut_prop in enumerate(comp_struts_prop["props"]):
                     if (not refr_strut_prop["is_true"]) or (not comp_strut_prop["is_true"]):
                         dist = math.sqrt((comp_strut_prop["y"] - refr_strut_prop["y"]) ** 2
                                          + (comp_strut_prop["x"] - refr_strut_prop["x"]) ** 2)
@@ -95,37 +172,51 @@ def get_accuracy(target_struts_props, output_struts_props, dist_thres=20, overla
                         comp_strut_prop["dist"] = dist
                         if dist <= dist_thres:
                             refr_strut_prop["is_true"] = True
+                            refr_strut_prop["label_cnt"] = [ic, ]
                             comp_strut_prop["is_true"] = True
+                            comp_strut_prop["label_cnt"] = [ir, ]
 
             # Decision by overlap ratio
-            for refr_strut_prop in refr_struts_prop:
+            for refr_strut_prop in refr_struts_prop["props"]:
                 if not refr_strut_prop["is_true"]:
                     overlap = 0
                     if len(comp_struts_prop) > 0:
-                        intersection = np.sum(refr_strut_prop["region"] & comp_struts_prop[0]["original"])
+                        intersection = np.sum((refr_struts_prop["label_image"] == refr_strut_prop["label"])
+                                              & (comp_struts_prop["label_image"] > 0))
                         overlap = intersection / refr_strut_prop["area"]
                     refr_strut_prop["overlap"] = overlap
                     if overlap > overlap_thres:
+                        cnt_list = np.sort(np.unique((refr_struts_prop["label_image"] == refr_strut_prop["label"])
+                                                     * comp_struts_prop["label_image"]))
                         refr_strut_prop["is_true"] = True
+                        refr_strut_prop["label_cnt"] = cnt_list[1:].tolist()
 
-            for comp_strut_prop in comp_struts_prop:
+            for comp_strut_prop in comp_struts_prop["props"]:
                 if not comp_strut_prop["is_true"]:
                     overlap = 0
                     if len(refr_struts_prop) > 0:
-                        intersection = np.sum(comp_strut_prop["region"] & refr_struts_prop[0]["original"])
+                        intersection = np.sum((comp_struts_prop["label_image"] == comp_strut_prop["label"])
+                                              & (refr_struts_prop["label_image"] > 0))
                         overlap = intersection / comp_strut_prop["area"]
                     comp_strut_prop["overlap"] = overlap
                     if overlap > overlap_thres:
+                        cnt_list = np.sort(np.unique((comp_struts_prop["label_image"] == comp_strut_prop["label"])
+                                                     * refr_struts_prop["label_image"]))
                         comp_strut_prop["is_true"] = True
+                        comp_strut_prop["label_cnt"] = cnt_list[1:].tolist()
 
     def _get_metric(struts_props):
         true, false = 0, 0
         for struts_prop in struts_props:
-            for strut_prop in struts_prop:
+            # true0, false0 = 0, 0
+            for strut_prop in struts_prop["props"]:
                 if strut_prop["is_true"]:
+                    # true0 += 1
                     true += 1
                 else:
+                    # false0 += 1
                     false += 1
+            # print(true0, false0)
         return true / (true + false + eps)
 
     # False negative & false positive decision
@@ -137,6 +228,87 @@ def get_accuracy(target_struts_props, output_struts_props, dist_thres=20, overla
     f_score = 2 * recall * precision / (recall + precision + eps)
 
     return f_score, precision, recall
+
+
+def get_distance(target_struts_props, output_struts_props):
+
+    def _calc_distance(refr_struts_props, comp_struts_props):
+
+        for i, (refr_struts_prop, comp_struts_prop) in enumerate(zip(refr_struts_props, comp_struts_props)):
+
+            for refr_strut_prop in refr_struts_prop["props"]:
+                if refr_strut_prop["is_true"]:
+                    cnt_list = refr_strut_prop["label_cnt"]
+                    # if len(cnt_list) == 0:
+                    #     continue
+                    refr_ps = refr_strut_prop["contour"]
+                    if any([cnt >= len(comp_struts_prop["props"]) for cnt in cnt_list]):
+                        continue
+                    comp_ps = np.concatenate([comp_struts_prop["props"][_i]["contour"] for _i in cnt_list])
+
+                    dist = np.ndarray((refr_ps.shape[0], comp_ps.shape[0]))
+                    for ir, refr_p in enumerate(refr_ps):
+                        for ic, comp_p in enumerate(comp_ps):
+                            dist[ir, ic] = math.sqrt((refr_p[0] - comp_p[0]) ** 2 + (refr_p[1] - comp_p[1]) ** 2)
+                    refr_dist = np.min(dist, axis=1)
+                    comp_dist = np.min(dist, axis=0)
+
+                    refr_strut_prop["hausdorff"] = np.max((np.max(refr_dist), np.max(comp_dist)))
+                    refr_strut_prop["avg_surface"] = np.mean(np.concatenate((refr_dist, comp_dist)))
+
+            for comp_strut_prop in comp_struts_prop["props"]:
+                if comp_strut_prop["is_true"]:
+                    cnt_list = comp_strut_prop["label_cnt"]
+                    # if len(cnt_list) == 0:
+                    #     continue
+                    comp_ps = comp_strut_prop["contour"]
+                    if any([cnt >= len(refr_struts_prop["props"]) for cnt in cnt_list]):
+                        continue
+                    refr_ps = np.concatenate([refr_struts_prop["props"][_i]["contour"] for _i in cnt_list])
+
+                    dist = np.ndarray((comp_ps.shape[0], refr_ps.shape[0]))
+                    for ic, comp_p in enumerate(comp_ps):
+                        for ir, refr_p in enumerate(refr_ps):
+                            dist[ic, ir] = math.sqrt((comp_p[0] - refr_p[0]) ** 2 + (comp_p[1] - refr_p[1]) ** 2)
+                    comp_dist = np.min(dist, axis=1)
+                    refr_dist = np.min(dist, axis=0)
+
+                    comp_strut_prop["hausdorff"] = np.max((np.max(comp_dist), np.max(refr_dist)))
+                    comp_strut_prop["avg_surface"] = np.mean(np.concatenate((comp_dist, refr_dist)))
+
+    def _get_mean_distance(refr_struts_props, comp_struts_props):
+
+        _distance = dict()
+        _distance["hd_r"], _distance["hd_c"] = [], []
+        _distance["asd_r"], _distance["asd_c"] = [], []
+
+        for refr_struts_prop, comp_struts_prop in zip(refr_struts_props, comp_struts_props):
+
+            for t_prop in refr_struts_prop["props"]:
+                if t_prop["is_true"]:
+                    if "hausdorff" in t_prop:
+                        _distance["hd_r"].append(t_prop["hausdorff"])
+                    if "avg_surface" in t_prop:
+                        _distance["asd_r"].append(t_prop["avg_surface"])
+
+            for o_prop in comp_struts_prop["props"]:
+                if o_prop["is_true"]:
+                    if "hausdorff" in o_prop:
+                        _distance["hd_c"].append(o_prop["hausdorff"])
+                    if "avg_surface" in o_prop:
+                        _distance["asd_c"].append(o_prop["avg_surface"])
+
+        _distance["hd_r"] = [np.mean(np.array(_distance["hd_r"])), np.median(np.array(_distance["hd_r"]))]
+        _distance["hd_c"] = [np.mean(np.array(_distance["hd_c"])), np.median(np.array(_distance["hd_c"]))]
+        _distance["asd_r"] = [np.mean(np.array(_distance["asd_r"])), np.median(np.array(_distance["asd_r"]))]
+        _distance["asd_c"] = [np.mean(np.array(_distance["asd_c"])), np.median(np.array(_distance["asd_c"]))]
+
+        return _distance
+
+    _calc_distance(target_struts_props, output_struts_props)
+    distance = _get_mean_distance(target_struts_props, output_struts_props)
+
+    return distance
 
 
 def get_struts_metric(output, target):
@@ -313,6 +485,37 @@ def get_psnr(outputs, targets):
     psnr = 10 * torch.log10((l_max ** 2) / (mse + eps))
 
     return psnr
+
+
+def gradient(img):
+
+    left = img
+    right = F.pad(img, [0, 1, 0, 0])[:, :, :, 1:]
+    top = img
+    bottom = F.pad(img, [0, 0, 0, 1])[:, :, 1:, :]
+
+    gx, gy = right - left, bottom - top
+    gx[:, :, :, -1] = 0
+    gy[:, :, -1, :] = 0
+
+    return torch.pow(gx, 2) + torch.pow(gy, 2)
+
+
+def axial_gradient(img):
+
+    top = img
+    bottom = F.pad(img, [0, 0, 0, 1])[:, :, 1:, :]
+
+    gy = bottom - top
+    gy[:, :, -1, :] = 0
+
+    return torch.abs(gy)
+
+
+# def get_struts_contour(img):
+
+
+
 
 #
 # def get_false_struts(output, target, thres=threshold, dist_thres=20, overlap_thres=0.5):

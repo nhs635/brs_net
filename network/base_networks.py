@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import init
 import functools
+import numpy as np
 
 
 def init_weights(net, init_type="kaiming", init_gain=0.02):
@@ -72,11 +73,21 @@ def set_requires_grad(nets, requires_grad=False):
                 param.requires_grad = requires_grad
 
 
+def build_heatmap(heat_ratio, size=(224, 224)):
+    if isinstance(size, int):
+        size = (size, size)
+    heat_ratio = F.interpolate(heat_ratio.unsqueeze(0).unsqueeze(0), size=size, mode="bilinear", align_corners=False)
+    heat_ratio = heat_ratio.squeeze().cpu().detach().numpy()
+    heat_ratio -= np.min(heat_ratio)
+    heat_map = heat_ratio / (np.max(heat_ratio) + 2e-10)
+    return heat_map
+
+
 class ConvBlock(nn.Module):
     """ Define a convolution block (conv + norm + actv). """
     def __init__(self, in_channels, out_channels,
                  kernel_size=(3, 3), padding_type="zero", padding=(1, 1), dilation=(1, 1), stride=(1, 1),
-                 norm_layer=nn.BatchNorm2d, activation=nn.ReLU, preactivation=False):
+                 norm_layer=nn.BatchNorm2d, activation=nn.ReLU, act_last=True):
         super(ConvBlock, self).__init__()
 
         # use_bias setup
@@ -84,13 +95,10 @@ class ConvBlock(nn.Module):
             use_bias = norm_layer.func == nn.InstanceNorm2d
         else:
             use_bias = norm_layer == nn.InstanceNorm2d
+        if not act_last:
+            use_bias = True
 
         self.conv_block = []
-
-        # Normalization & activation
-        if preactivation:
-            self.conv_block += [norm_layer(num_features=in_channels)] if norm_layer is not None else []
-            self.conv_block += [activation(inplace=True)] if activation is not None else []
 
         # Padding option
         p = 0
@@ -113,9 +121,12 @@ class ConvBlock(nn.Module):
                                       bias=use_bias)]
 
         # Normalization & activation
-        if not preactivation:
+        if act_last:
             self.conv_block += [norm_layer(num_features=out_channels)] if norm_layer is not None else []
-            self.conv_block += [activation(inplace=True)] if activation is not None else []
+            self.conv_block += [activation(inplace=False)] if activation is not None else []
+        else:
+            self.conv_block += [activation(inplace=False)] if activation is not None else []
+            self.conv_block += [norm_layer(num_features=out_channels)] if norm_layer is not None else []
 
         self.conv_block = nn.Sequential(*self.conv_block)
 
@@ -124,7 +135,7 @@ class ConvBlock(nn.Module):
 
 
 class ConvBlock2(nn.Module):
-    """ Define a double convolution block (conv + norm + actv). """
+    """ Define a double convolution block (conv + norm + actv) with the identical topology. """
     def __init__(self, in_channels, out_channels,
                  kernel_size=(3, 3), padding_type="zero", padding=(1, 1), dilation=(1, 1), stride=(1, 1),
                  norm_layer=nn.BatchNorm2d, activation=nn.ReLU):
@@ -166,8 +177,8 @@ class UpConv(nn.Module):
 class DeconvBlock(nn.Module):
     """ Define a deconvolution block (deconv + norm + actv). """
     def __init__(self, in_channels, out_channels,
-                 kernel_size=(3, 3), padding=(1, 1), output_padding=(0, 0), dilation=(1, 1), stride=(1, 1),
-                 norm_layer=nn.BatchNorm2d, activation=nn.ReLU):
+                 kernel_size=(3, 3), padding=(1, 1), output_padding=(1, 1), dilation=(1, 1), stride=(1, 1),
+                 norm_layer=nn.BatchNorm2d, activation=nn.ReLU, act_last=True):
         super(DeconvBlock, self).__init__()
 
         # use_bias setup
@@ -175,8 +186,12 @@ class DeconvBlock(nn.Module):
             use_bias = norm_layer.func == nn.InstanceNorm2d
         else:
             use_bias = norm_layer == nn.InstanceNorm2d
+        if not act_last:
+            use_bias = True
 
         self.deconv_block = []
+
+        # Deconvolution
         self.deconv_block += [nn.ConvTranspose2d(in_channels=in_channels,
                                                  out_channels=out_channels,
                                                  kernel_size=kernel_size,
@@ -185,8 +200,15 @@ class DeconvBlock(nn.Module):
                                                  output_padding=output_padding,
                                                  dilation=dilation,
                                                  bias=use_bias)]
-        self.deconv_block += [norm_layer(num_features=out_channels)] if norm_layer is not None else []
-        self.deconv_block += [activation(inplace=True)] if activation is not None else []
+
+        # Normalization & activation
+        if act_last:
+            self.deconv_block += [norm_layer(num_features=out_channels)] if norm_layer is not None else []
+            self.deconv_block += [activation(inplace=False)] if activation is not None else []
+        else:
+            self.deconv_block += [activation(inplace=False)] if activation is not None else []
+            self.deconv_block += [norm_layer(num_features=out_channels)] if norm_layer is not None else []
+
         self.deconv_block = nn.Sequential(*self.deconv_block)
 
     def forward(self, x):
@@ -210,40 +232,37 @@ class SubPixelConv(nn.Module):
 
 class ResidualBlock(nn.Module):
     """ Define a residual network block. """
-    def __init__(self, in_channels, out_channels, padding_type="zero", downsample=False,
-                 norm_layer=nn.BatchNorm2d, activation=nn.ReLU, preactivation=False):
+    def __init__(self, in_channels, out_channels, padding_type="zero", downsample=False, dilation=1,
+                 norm_layer=nn.BatchNorm2d, activation=nn.ReLU):
         """ Initialize a residual network block """
         super(ResidualBlock, self).__init__()
 
         # Residual block definition
+        d = dilation
         self.residual_block = []
         self.residual_block += [ConvBlock(in_channels, out_channels, stride=(1, 1) if not downsample else (2, 2),
-                                          kernel_size=(3, 3), padding_type=padding_type,
-                                          padding=(1, 1) if padding_type == "zero" else (1,)*4,
-                                          norm_layer=norm_layer, activation=activation,
-                                          preactivation=preactivation)]
+                                          kernel_size=(3, 3), padding_type=padding_type, dilation=dilation,
+                                          padding=(d, d) if padding_type == "zero" else (d,)*4,
+                                          norm_layer=norm_layer, activation=activation)]
         self.residual_block += [ConvBlock(out_channels, out_channels, stride=(1, 1),
-                                          kernel_size=(3, 3), padding_type=padding_type,
-                                          padding=(1, 1) if padding_type == "zero" else (1,)*4,
-                                          norm_layer=norm_layer, activation=None,
-                                          preactivation=preactivation)]
+                                          kernel_size=(3, 3), padding_type=padding_type, dilation=dilation,
+                                          padding=(d, d) if padding_type == "zero" else (d,)*4,
+                                          norm_layer=norm_layer, activation=None)]
         self.residual_block = nn.Sequential(*self.residual_block)
         self.activation = activation()
 
         # Bypass 1x1 convolution
         self.conv_1x1 = []
-        if (in_channels != out_channels) or downsample:
-            if preactivation:
-                self.conv_1x1 += [norm_layer(num_features=in_channels)] if norm_layer is not None else []
+        if (in_channels != out_channels) or downsample:  # projection mapping
             self.conv_1x1 += [nn.Conv2d(in_channels=in_channels,
                                         out_channels=out_channels,
                                         kernel_size=(1, 1),
                                         stride=(1, 1) if not downsample else (2, 2),
+                                        dilation=dilation,
                                         bias=False)]
-            if not preactivation:
-                self.conv_1x1 += [norm_layer(num_features=out_channels)] if norm_layer is not None else []
-        else:
-            self.conv_1x1 += [nn.LeakyReLU(negative_slope=1)]  # identity mapping
+            self.conv_1x1 += [norm_layer(num_features=out_channels)] if norm_layer is not None else []
+        else:  # identity mapping
+            self.conv_1x1 += [nn.LeakyReLU(negative_slope=1)]
 
         self.conv_1x1 = nn.Sequential(*self.conv_1x1)
 
@@ -251,6 +270,50 @@ class ResidualBlock(nn.Module):
         """ Forward function with skip connection. """
         y = self.conv_1x1(x) + self.residual_block(x)  # add skip connection
         return self.activation(y)
+
+
+class FusionResidualBlock(nn.Module):
+    """ Define a residual network block for fusion-net. """
+    def __init__(self, in_channels, out_channels, padding_type="zero", downsample=False, dilation=1,
+                 norm_layer=nn.BatchNorm2d, activation=nn.ReLU, act_last=False):
+        """ Initialize a residual network block """
+        super(FusionResidualBlock, self).__init__()
+
+        # downsampling scheme? padding type? dilation?
+        d = dilation
+
+        # Connecting convolution layer definition
+        self.conv_block1 = ConvBlock(in_channels, out_channels, stride=(1, 1),
+                                     kernel_size=(3, 3), padding_type=padding_type, dilation=1,
+                                     padding=(d, d) if padding_type == "zero" else (d,)*4,
+                                     norm_layer=norm_layer, activation=activation, act_last=act_last)
+        self.conv_block2 = ConvBlock(out_channels, out_channels, stride=(1, 1),
+                                     kernel_size=(3, 3), padding_type=padding_type, dilation=1,
+                                     padding=(d, d) if padding_type == "zero" else (d,) * 4,
+                                     norm_layer=norm_layer, activation=activation, act_last=act_last)
+
+        # Residual block definition
+        self.residual_block = []
+        self.residual_block += [ConvBlock(out_channels, out_channels, stride=(1, 1),
+                                          kernel_size=(3, 3), padding_type=padding_type, dilation=dilation,
+                                          padding=(d, d) if padding_type == "zero" else (d,)*4,
+                                          norm_layer=norm_layer, activation=activation, act_last=act_last)]
+        self.residual_block += [ConvBlock(out_channels, out_channels, stride=(1, 1),
+                                          kernel_size=(3, 3), padding_type=padding_type, dilation=dilation,
+                                          padding=(d, d) if padding_type == "zero" else (d,)*4,
+                                          norm_layer=norm_layer, activation=activation, act_last=act_last)]
+        self.residual_block += [ConvBlock(out_channels, out_channels, stride=(1, 1),
+                                          kernel_size=(3, 3), padding_type=padding_type, dilation=dilation,
+                                          padding=(d, d) if padding_type == "zero" else (d,) * 4,
+                                          norm_layer=norm_layer, activation=activation, act_last=act_last)]
+        self.residual_block = nn.Sequential(*self.residual_block)
+
+    def forward(self, x):
+        """ Forward function with skip connection. """
+        x0 = self.conv_block1(x)
+        y = x0 + self.residual_block(x0)  # add skip connection
+        y = self.conv_block2(y)
+        return y
 
 
 class MixedPooling(nn.Module):
@@ -338,20 +401,141 @@ class GlobalConvModule(nn.Module):
         self.conv_kx1_2 = nn.Conv2d(in_channels=out_channels, out_channels=out_channels,
                                     kernel_size=(k, 1), padding=(p, 0))
 
-        self.br = [nn.Conv2d(in_channels=out_channels, out_channels=out_channels,
-                             kernel_size=(3, 3), padding=(1, 1)),
-                   nn.ReLU(),
-                   nn.Conv2d(in_channels=out_channels, out_channels=out_channels,
-                             kernel_size=(3, 3), padding=(1, 1))]
-        self.br = nn.Sequential(*self.br)
-
     def forward(self, x):
         # global convolutional network
         x1 = self.conv_1xk_1(self.conv_kx1_1(x))
         x2 = self.conv_kx1_2(self.conv_1xk_2(x))
         y = x1 + x2
 
+        return y
+
+
+class BoundaryRefinement(nn.Module):
+    """ Define a boundary refinement module block. """
+    def __init__(self, in_channels, out_channels, kernel_size=15):
+        """ Initialize a boundary refinement module block """
+        super(BoundaryRefinement, self).__init__()
+
+        p = int((kernel_size - 1) / 2)
+        self.br = [nn.Conv2d(in_channels=in_channels, out_channels=out_channels,
+                             kernel_size=(kernel_size, kernel_size), padding=(p, p)),
+                   nn.BatchNorm2d(num_features=out_channels),
+                   nn.ReLU(),
+                   nn.Conv2d(in_channels=out_channels, out_channels=out_channels,
+                             kernel_size=(kernel_size, kernel_size), padding=(p, p)),
+                   nn.BatchNorm2d(num_features=out_channels),]
+        self.br = nn.Sequential(*self.br)
+
+    def forward(self, x):
         # boundary refinement
-        y = y + self.br(y)
+        y = x + self.br(x)
 
         return y
+
+
+class MultiScaleResidualBlock(nn.Module):
+    """ Define a multi-scale dilated residual module. """
+    def __init__(self, in_channels, out_channels, norm_layer=nn.BatchNorm2d, activation=nn.ReLU):
+        """ Initialize a multiscale residual block """
+        super(MultiScaleResidualBlock, self).__init__()
+
+        # Multiscaled dilated residual block definition
+        dilated_convs = []
+        for d in range(4):
+            dilated_conv = []
+            dilated_conv += [ConvBlock(in_channels, out_channels, stride=(1, 1),
+                                       kernel_size=(3, 3), padding_type="zero", dilation=2**d,
+                                       padding=(2**d, 2**d), norm_layer=norm_layer, activation=activation)]
+            dilated_conv += [ConvBlock(out_channels, out_channels, stride=(1, 1),
+                                       kernel_size=(3, 3), padding_type="zero", dilation=2**d,
+                                       padding=(2**d, 2**d), norm_layer=norm_layer, activation=None)]
+            dilated_conv = nn.Sequential(*dilated_conv)
+            dilated_convs.append(dilated_conv)
+
+        self.dilated_conv1 = dilated_convs[0]
+        self.dilated_conv2 = dilated_convs[1]
+        self.dilated_conv3 = dilated_convs[2]
+        self.dilated_conv4 = dilated_convs[3]
+        self.activation = activation()
+
+        self.conv_1x1_ms = ConvBlock(4 * out_channels, out_channels, kernel_size=(1, 1), padding=(0, 0), activation=None)
+
+        # Projection mapping
+        self.conv_1x1_pr = ConvBlock(in_channels, out_channels, kernel_size=(1, 1), padding=(0, 0), activation=None)
+
+    def forward(self, x):
+        dilated_convs = [self.dilated_conv1, self.dilated_conv2, self.dilated_conv3, self.dilated_conv4]
+        y1 = self.conv_1x1_ms(torch.cat(tuple(dilated_conv(x) for dilated_conv in dilated_convs), dim=1))
+        y2 = self.conv_1x1_pr(x)
+        y = self.activation(y1 + y2)
+
+        return y
+
+
+class GradCAM:
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.target_output = None
+        self.target_output_grad = None
+
+        def forward_hook(_, __, output):
+            self.target_output = output.clone()
+
+        def backward_hook(_, __, grad_output):
+            assert len(grad_output) == 1
+            self.target_output_grad = grad_output[0].clone()
+
+        self.target_layer.register_forward_hook(forward_hook)
+        self.target_layer.register_backward_hook(backward_hook)
+
+    def forward_pass(self, image):
+        self.model.eval()
+        self.model.zero_grad()
+        return self.model(image)
+
+    def get_grad_cam(self, image):
+        assert len(image.size()) == 3
+        image = image.unsqueeze(0)
+        out = self.forward_pass(image)
+        out.backward()  # softmax output일 때는 수정해야 함.
+
+        grad = self.target_output_grad
+        grad = F.adaptive_avg_pool2d(grad, output_size=(1, 1))
+
+        feature = self.target_output
+        feature = feature * grad
+        feature = torch.sum(feature, dim=1)
+        feature = F.relu(feature)
+
+        return feature.squeeze()
+
+
+class GuidedBackProp:
+    def __init__(self, model):
+        self.model = model
+
+        def backward_hook(_, grad_input, grad_output):
+            assert len(grad_input) == 1
+            assert len(grad_output) == 1
+            grad_input = ((grad_output[0] > 0.0).float() * grad_input[0],)
+
+        for _, module_ in model.named_modules():
+            if isinstance(module_, nn.ReLU):
+                module_.register_backward_hook(backward_hook)
+
+    def forward_pass(self, image):
+        self.model.eval()
+        self.model.zero_grad()
+        return self.model(image)
+
+    def get_guided_backprop(self, image):
+        assert len(image.size()) == 3
+        image = image.unsqueeze(0)  # nchw
+        if image.grad is not None:
+            image.grad.zero_()
+        image.requires_grad_(True)  # underscore func: in-place func
+        out = self.forward_pass(image)
+        out.backward()  # softmax output일 때는 수정해야 함.
+
+        return image.grad.squeeze().cpu().detach().numpy()

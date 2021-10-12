@@ -22,10 +22,8 @@ class AdversarialSolver(BaseSolver):
 
         # Member variables for data
         self.images, self.masks, self.weights, self.outputs = None, None, None, None
-        self.model_types, self.optimizer_types = list(), list()
-        for net in ["gen", "dsc"]:
-            self.model_types.append(net)
-            self.optimizer_types.append(net)
+        self.model_types = ["gen", "dsc"]
+        self.optimizer_types = ["gen", "dsc"]
         self.loss_types = ["bce", "l1", "d_real", "d_fake", "g_fake"]
         self.metric_types = ["dice"]
 
@@ -126,7 +124,7 @@ class AdversarialSolver(BaseSolver):
         # Loss integration and gradient calculation (backward)
         loss = (d_loss_real + d_loss_fake) / 2
         if phase == "train":
-            loss.backward()
+            loss.backward(retain_graph=True)
 
         self.loss["d_real"][phase].append(d_loss_real.item())
         self.loss["d_fake"][phase].append(d_loss_fake.item())
@@ -236,8 +234,8 @@ class AdversarialSolver(BaseSolver):
                     self.forward(images, masks, weights)
 
                     # Backward
-                    self.backward("dsc", phase="valid")
-                    self.backward("gen", phase="valid")
+                    self.d_backward(phase="valid")
+                    self.g_backward(phase="valid")
 
                     # Calculate evaluation metrics
                     self.calculate_metric(phase="valid")
